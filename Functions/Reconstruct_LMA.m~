@@ -1,0 +1,431 @@
+function [ recon,output] = Reconstruct_LMA(data,options )
+%RECONSTRUCT_LMA - Applies Levenberg-Marquardt Algorithm to 3D ptychography
+%problem. The solution update step-size is computed by the Conjugate
+%Gradient Method
+%
+%Input:
+%   data    - structure containing ptychographic dataset: Diffraction
+%             patterns intensities, scanning positions, illumination/probe
+%             function...
+%   options - structure with reconstruction properties: number of
+%             iterations, stopping criteria, initial regularization...
+%Output:
+%   recon   - 3D array / tomogram of refractive indexes (decrements from
+%             unit)
+%   output  - structure with convergence properties of the reconstruction
+%               .r_in - Cost-function evolution during the CGM
+%               .r_out - Cost-function evolution during the LMA
+% This file is part of 3DPtychoTomo, which is released under the
+% BSD 3-Clause License. Please see LICENSE.txt
+% Tiago Ramos (tiagoj@dtu.dk) May-2018
+
+if nargin<2 || isempty(options)
+    options=[];
+end
+options = checkoptions(options);
+data.noise_model=options.noise_model;
+%%% INITIALIZATION %%%
+
+%Determine Tomogram/Reconstruction dimensions from scanning coordinates 
+N =ceil( max(data.parameters(:,2))-min(data.parameters(:,2)) +data.sp(2));
+M =ceil( max(data.parameters(:,3))-min(data.parameters(:,3)) +data.sp(1));
+%Reconstruction initial guess:
+if ~isfield(data,'recon0')
+    recon = zeros(N,N,M);
+else
+    recon = data.recon0;
+end
+hN = recon*0+1e-10;
+%Parse remaining optimization properties form options
+mu = options.mu0;
+vivi = options.v0;
+n_iter = options.n_iter;
+n_iter_cgm = options.n_iter_cgm;
+r_out = zeros(n_iter,1);
+r_in = zeros(n_iter_cgm,n_iter);
+mus=r_out;
+musP=mus;
+stop=false;
+c1=options.c1;c2=options.c2;c3=options.c3;c4=options.c4;c5=options.c5;
+%Initialize Probe Guess from Inverse Fourier Transform of averaged
+%diffraction patterns (amplitude).
+if options.update_probe
+    probe_guess = abs(Ift2(sqrt(mean(data.Imeas,3))));
+    data.probe = probe_guess;
+    muP = NaN;
+    hP = data.probe/10;
+    r_in_P = r_in;
+end
+%Open Images if in debug mode
+% hf1 = [];hf2 = [];
+if options.monitor
+% [hf1,hf2] = PrepareImages(options);
+end
+
+%%% START LEVENBERG-MARQUARDT LOOP %%%
+k = 0;
+
+while (k<=n_iter) && stop==false
+    k = k+1;
+    disp(['[iter:',num2str(k),'] Updating Data Structure...'])
+    data = UpdateData(data,recon);
+    %Compute forward model
+    disp(['[iter:',num2str(k),'] Computing Synth. Diffraction Patterns...'])
+    II = ForwardF(recon,data);
+    %Apply mask to corrupted pixels
+    if isfield(data,'mask_dp')
+        II = II.*mask_dp;
+    end
+    %Calculate Residual vector
+    rr = II - data.Imeas;
+    if strcmp(options.noise_model,'poisson')
+        rr = rr./sqrt(data.Imeas+1);
+    end
+    r_out(k) = rr(:)'*rr(:);
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+    %%%%        Update Reconstruction Volume        %%%%
+    %Use Conjugate Gradient Method to compute step size%
+
+        disp(['[iter:',num2str(k),'] Updating Reconstruction Volume...']);
+        b = -JacAdj_hg(recon,data,rr);
+        % Initialize regularization parameter
+        if isnan(mu)
+            mu = norm(b(:));
+            mu0 = mu;
+            disp([char(956),'0 = ',num2str(mu)]);
+        end
+        
+        mus(k)=mu;
+        Tau = @(hN) JacAdj_hg(recon,data,Jac_hN(recon,data,hN)) + mu*hN;
+        [hN, r_in] = CGM(Tau, b, hN*0, options, r_in, r_out,k);
+        
+        if norm(hN(:))<=c2*(norm(recon(:))+c2)
+            stop = true;
+        end
+        
+        %Update Solution
+        recon = recon + hN;
+        
+        %Constraints in Reconstructed volume
+        recon = -abs(real(recon)) + 1i.*min(max(imag(recon),0),1);
+        
+        %Update Damping
+        [mu,stop1] = UpdateDamping(data,mu, vivi, recon, hN, rr,c4);
+        %stop = stop+stop1;
+        mu = min(mu,mu0);
+
+    if options.update_probe
+    %%%%            Update Probe Function           %%%%
+    %Use Conjugate Gradient Method to compute step size%
+
+        disp(['[iter:',num2str(k),'] Updating Probe...']);
+        b = -JacAdjP_hg(recon,data,rr);
+        % Initialize regularization parameter
+        if isnan(muP)
+            muP = norm(b(:));
+            muP0 = muP;
+            disp([char(956),'P0 = ',num2str(muP)]);
+        end
+        
+        musP(k) = muP;
+        Tau = @(hP) JacAdjP_hg(recon,data,Jac_hP(recon,data,hP)) + muP*hP;
+        [hP, r_in_P] = CGM(Tau, b, hP*0, options, r_in_P, r_out,k);
+        
+        if norm(hP(:))<=c2*(norm(data.probe(:))+c2)
+            stop = true;
+        end
+        
+        %Update Probe
+        data.probe = data.probe + hP;
+        
+        %Constraints in Probe array
+        
+        %Update Damping
+        [muP,stop1] = UpdateDampingP(data,muP, vivi, recon, hP, rr,c4);
+        stop = stop+stop1;
+        muP = min(muP,muP0);
+    end
+    
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    stop = stop | (r_out(k)<c3);
+    if options.monitor
+        ImageLMA(recon,r_out);
+    end
+    
+end
+
+output.r_in = r_in;
+output.r_out = r_out;
+output.mus = mus;
+try
+    output.r_in_p = r_in_P;
+    output.musP = musP;
+catch
+    display('Reconstruction obtained without Probe retrieval')
+end
+
+end
+
+function [mu,stop] = UpdateDamping(data,mu, v, recon, hN, rr,c4)
+%UPDATEDAMPING - updates damping parameter mu for the LMA.
+stop=false;
+r_norm=rr(:)'*rr(:);
+new_r = (data.Imeas-ForwardF(recon,data));
+if strcmp(data.noise_model,'poisson')
+    new_r = new_r./sqrt(data.Imeas+1);
+end
+new_r_norm = new_r(:)'*new_r(:);
+actual_reduction = r_norm - new_r_norm;
+predicted_reduction = abs(hN(:)'*reshape(JacAdj_hg(recon,data,rr),[],1))-mu*hN(:)'*hN(:);
+% rho2=r_norm-rho2(:)'*rho2(:);
+rho=actual_reduction/(real(predicted_reduction)+sqrt(eps));
+if isnan(rho), rho=0;end
+display([char(961),' = ',num2str(rho)]);
+display([char(956),' = ',num2str(mu)]);
+if rho>.75
+    stop=abs(r_norm-new_r_norm)<c4*r_norm;
+    mu=mu*max(1/3,min(1-(2*rho-1)^3,1));
+elseif rho<0.25
+    mu=mu*v;
+end
+
+end
+
+function [muP,stop] = UpdateDampingP(data,muP, v, recon, hP, rr,c4)
+%UPDATEDAMPING - updates damping parameter mu for the LMA. To be used in
+%probe retrieval
+stop=false;
+r_norm=rr(:)'*rr(:);
+r_expected = (data.Imeas-ForwardF(recon,data));
+if strcmp(data.noise_model,'poisson')
+    r_expected = r_expected./sqrt(data.Imeas+1);
+end
+r_norm_expected = r_expected(:)'*r_expected(:);
+rho1 = r_norm - r_norm_expected;
+rho2 = abs(hP(:)'*reshape(JacAdjP_hg(recon,data,rr),[],1))-mu*hP(:)'*hP(:);
+% rho2=r_norm-rho2(:)'*rho2(:);
+rho=rho1/real(rho2);
+if isnan(rho), rho=0;end
+display([char(961),' = ',num2str(rho)]);
+display([char(956),' = ',num2str(muP)]);
+if rho>.75
+    stop=abs(r_norm-r_norm_expected)<c4*r_norm;
+    muP=muP*max(1/3,min(1-(2*rho-1)^3,1));
+elseif rho<0.25
+    muP=muP*v;
+end
+end
+
+function [h,r_in] = CGM (Tau,b,h,options,r_in,r_out,k)
+%CGM - Conjugate Gradient Method to solve the system of equations Tau*hN=b
+
+%Initialization
+r_j=b-Tau(h);
+p_j=r_j;
+j=0;
+
+%Start CGM loop
+while j <= options.n_iter_cgm
+    j = j+1;
+    Ap = Tau(p_j);
+    alpha_cgm = r_j(:)'*r_j(:)/real(p_j(:)'*Ap(:)+eps);
+    delta_h = alpha_cgm*p_j;
+    %if max(abs(delta_h(:))) < options.c5, break, end
+    h = h + delta_h;
+    r_in(j,k) = r_j(:)'*r_j(:);
+    if j>=3
+        if (r_in(j,k)>r_in(j-2,k)) && (r_in(j,k)>r_in(j-1,k))
+            h = h - delta_h;
+            break
+        end
+    end
+    r_j_old = r_j;
+    r_j = r_j-alpha_cgm*Ap;
+    %Update conjugate gradient direction
+    if strcmp(options.cgm_method,'polak-ribiere')
+        beta_j=max(r_j(:)'*(r_j(:)-r_j_old(:))/(r_j_old(:)'*r_j_old(:)+(eps)),0);
+    elseif strcmp(options.cgm_method,'hestenes-stiefel') || ...
+            strcmp(options.cgm_method,'hestenes')
+        beta_j=max(-r_j(:)'*(r_j(:)-r_j_old(:))/...
+            (real(p_j(:)'*(r_j(:)-r_j_old(:)))+(eps)),0);
+    end
+    p_j = r_j+beta_j*p_j;
+    
+    if options.monitor
+%         ImageCGM(hf2,b,Tau(h),h,r_in);
+        ImageCGM2(b,Tau(h),h,r_in,r_out);
+        Save_Gif(,'CGM.gif');
+    end
+    
+end
+
+end
+
+function [def_opt] = checkoptions(options)
+def_opt=options;
+
+%Damping parameter
+if ~isfield(def_opt,'mu0')
+    def_opt.mu0=NaN;%1e-3;
+end
+if def_opt.mu0<0
+    error('The damping parameter mu must be non-negative');
+end
+if isnan(def_opt.mu0)
+    display(['The initial damping parameter will be computed based on',...
+        ' the dataset.']);
+end
+if ~isfield(def_opt,'v0')
+    def_opt.v0=2;
+end
+%Number of iterations
+if ~isfield(def_opt,'n_iter')
+    def_opt.n_iter=100;
+end
+if ~isfield(def_opt,'n_iter_cgm')
+    def_opt.n_iter_cgm=20;
+end
+%Noise model to consider:
+if ~isfield(def_opt,'noise_model')
+    def_opt.noise_model='poisson';
+end
+if ~isfield(def_opt,'cgm_method')
+    def_opt.cgm_method='hestenes-stiefel';
+end
+if ~isfield(def_opt,'update_probe')    
+    def_opt.update_probe=false;
+end
+
+%Thresholds for LMA and CGM
+if ~isfield(def_opt,'c1')
+    def_opt.c1 = 1;%Maximum Gradient
+end
+if ~isfield(def_opt,'c2')
+    def_opt.c2 = 1e-51;%minimum relative change in magnitude of recon
+end
+if ~isfield(def_opt,'c3')
+    def_opt.c3 = 1e-15;%minimum residual vector norm
+end
+if ~isfield(def_opt,'c4')
+    def_opt.c4 = 1e-15;%minimum relative reduction in residual vector
+end
+if ~isfield(def_opt,'c5')
+    def_opt.c5 = 1e-15;%minimum change in amplitude of hN during CGM
+end
+
+%Images on/off
+if ~isfield(def_opt,'monitor')
+    def_opt.monitor=true;
+end
+
+%Save Gif
+if ~isfield(def_opt,'savegif')
+    def_opt.savegif=[0,0];
+end
+if numel(def_opt.savegif)==1
+    def_opt.savegif=[def_opt.savegif,def_opt.savegif];
+end
+
+end
+
+% function [hf1,hf2] = PrepareImages(options)
+% hf1=[];hf2=[];
+% if options.monitor==true
+% close all
+% figure('color','w','units','normalized','outerposition',[.1 .1 .8 .8]);
+% hf1=tight_subplot(1,3,[0.05 0.05]);
+% figure('color','w','units','normalized','outerposition',[.1 .1 .8 .8]);
+% hf2=tight_subplot(2,4,[0.05 0.05]);    
+%   
+% end
+% end
+
+% function [] = ImageCGM(hf,b,TauhN,hN,r_in)
+% figure(2);
+% 
+% axes(hf(1)),imagesc(real(b(:,:,round(end/2))));colorbar
+% axes(hf(2)),imagesc(real(TauhN(:,:,round(end/2))));colorbar
+% axes(hf(3)),imagesc(real(hN(:,:,round(end/2))));colorbar
+% axes(hf(4)),semilogy(r_in);
+% axes(hf(5)),imagesc(imag(b(:,:,round(end/2))));colorbar
+% axes(hf(6)),imagesc(imag(TauhN(:,:,round(end/2))));colorbar
+% % axes(hf(7)),imagesc(imag(hN(:,:,round(end/2))));colorbar
+% axes(hf(7)),imagesc(squeeze(imag(hN(:,round(end/2),:)))');colorbar
+% axes(hf(8)),imagesc(squeeze(real(hN(:,round(end/2),:)))');colorbar
+% 
+% for l=[1:3,5:8]
+%     axes(hf(l))
+%     axis equal tight off
+% end
+% drawnow
+% 
+% end
+
+function [] = ImageLMA(recon,r_out)
+figure(1);
+set(gcf,'Position',[1,50,1920,923],'color','w')
+
+subplot(131),imagesc(squeeze(real(recon(:,:,round(end/2))))');title('-\delta')
+subplot(132),imagesc(squeeze(imag(recon(:,:,round(end/2))))');title('\beta')
+subplot(133),semilogy(r_out);
+title('Cost-function evolution in LMA')
+xlabel('Iteration #')
+ylabel('Cost-function')
+for l=131:132
+    subplot(l)
+    axis square tight off
+    colorbar
+end
+subplot(133)
+axis square tight
+colormap(bone)
+drawnow
+
+end
+
+function [] = ImageCGM2(b,TauhN,hN,r_in,r_out)
+figure(2);
+set(gcf,'Position',[1,50,1920,923],'color','w')
+subplot(4,5,1),imagesc(real(TauhN(:,:,round(end/2))));title({'(J''J+ \lambda I)h_N';'real'})
+subplot(4,5,2),imagesc(real(b(:,:,round(end/2))));title({'-J''r';'real'})
+subplot(4,5,3),imagesc(real(hN(:,:,round(end/2))));title({'h_N','real'})
+subplot(4,5,[4,5,9,10]),semilogy(r_in);title('CGM residual evolution');
+ylabel('Cost-function');
+subplot(4,5,6),imagesc(imag(TauhN(:,:,round(end/2))));title('imag')
+subplot(4,5,7),imagesc(imag(b(:,:,round(end/2))));title('imag')
+subplot(4,5,8),imagesc(imag(hN(:,:,round(end/2))));title('imag')
+subplot(4,5,11),imagesc(real(squeeze(TauhN(:,round(end/2),:)))');title('real')
+subplot(4,5,12),imagesc(real(squeeze(b(:,round(end/2),:)))');title('real')
+subplot(4,5,13),imagesc(real(squeeze(hN(:,round(end/2),:)))');title('real')
+subplot(4,5,[14,15,19,20]),semilogy(r_out);
+title({'CGM Iteration #';'LMA residual evolution'});
+xlabel('LMA Iteration#')
+ylabel('Cost-function')
+subplot(4,5,16),imagesc(imag(squeeze(TauhN(:,round(end/2),:)))');title('imag')
+subplot(4,5,17),imagesc(imag(squeeze(b(:,round(end/2),:)))');title('imag')
+subplot(4,5,18),imagesc(imag(squeeze(hN(:,round(end/2),:)))');title('imag')
+
+for k=[1:3,6:8]
+    subplot(4,5,k)
+    xlabel('z')
+    ylabel('x')
+end
+for k=[11:13,16:18]
+    subplot(4,5,k)
+    xlabel('x')
+    ylabel('y')
+end
+for k=[1:3,6:8,11:13,16:18]
+    subplot(4,5,k)
+    axis square
+    colorbar
+    set(gca,'Xtick',[],'Ytick',[])
+
+end
+
+drawnow
+
+end
+
+
